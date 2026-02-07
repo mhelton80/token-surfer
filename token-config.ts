@@ -80,6 +80,10 @@ export const PORT          = envNum("PORT", 8080);
 // ─── Historical Data Sources ──────────────────────────────────
 export const COINGECKO_ID  = envStr("COINGECKO_ID", "solana");
 
+// ─── Jupiter API ──────────────────────────────────────────────
+export const JUPITER_API_URL = envStr("JUPITER_API_URL", "https://api.jup.ag/swap/v1");
+export const JUPITER_API_KEY = envStr("JUPITER_API_KEY", "");
+
 // ─── Derived ──────────────────────────────────────────────────
 export const BOT_NAME = `${TOKEN_SYMBOL} Surfer V6`;
 export const WARMUP_BARS = Math.max(EMA_SLOW_LEN, ATR_LEN) + 5;
@@ -103,6 +107,8 @@ export function printConfig(): void {
   console.log(`  Size:      ${(TRADE_PCT_USDC * 100).toFixed(0)}% of USDC`);
   console.log(`  Slippage:  ${MAX_SLIPPAGE_BPS} bps`);
   console.log(`  Cluster:   ${SOLANA_CLUSTER}`);
+  console.log(`  Jupiter:   ${JUPITER_API_URL}`);
+  console.log(`  API Key:   ${JUPITER_API_KEY ? "✓ set" : "✗ NOT SET (will get 401)"}`);
   console.log();
   console.log(`  ╔══════════════════════════════════════╗`);
   console.log(`  ║  SWAP ARMING STATUS: ${SWAPS_ARMED ? "🟢 ARMED   " : "🔴 DISARMED"}  ║`);

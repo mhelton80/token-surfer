@@ -1,17 +1,29 @@
 /**
  * Token-Surfer V6 — Jupiter DEX Integration
  * 
- * Handles price quotes and swap execution via Jupiter's Metis API.
+ * Handles price quotes and swap execution via Jupiter's Swap API.
  * Token-agnostic: uses mints from token-config.ts.
+ * 
+ * Supports:
+ *   - Public Jupiter API (api.jup.ag/swap/v1)
+ *   - QuickNode Metis (your-endpoint.quiknode.pro/...)
+ *   - Any self-hosted Jupiter API
  */
 
 import {
   TOKEN_MINT, USDC_MINT, TOKEN_DECIMALS, TOKEN_UNIT, USDC_UNIT,
   PRICE_PROBE_AMOUNT, MAX_SLIPPAGE_BPS, TOKEN_SYMBOL,
+  JUPITER_API_URL, JUPITER_API_KEY,
 } from "./token-config.js";
 
-const JUPITER_QUOTE_URL = "https://lite-api.jup.ag/v1/quote";
-const JUPITER_SWAP_URL  = "https://lite-api.jup.ag/v1/swap";
+// Jupiter API base URL and auth
+const JUPITER_BASE = JUPITER_API_URL;
+
+function jupiterHeaders(): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (JUPITER_API_KEY) h["x-api-key"] = JUPITER_API_KEY;
+  return h;
+}
 
 export interface QuoteResult {
   priceUsdcPerToken: number;
@@ -31,9 +43,12 @@ export async function getTokenPrice(): Promise<number> {
     outputMint: USDC_MINT,
     amount:     PRICE_PROBE_AMOUNT.toString(),
     slippageBps: "50",
+    restrictIntermediateTokens: "true",
   });
 
-  const res = await fetch(`${JUPITER_QUOTE_URL}?${params}`);
+  const res = await fetch(`${JUPITER_BASE}/quote?${params}`, {
+    headers: jupiterHeaders(),
+  });
   if (!res.ok) {
     throw new Error(`Jupiter quote failed: ${res.status} ${res.statusText}`);
   }
@@ -54,9 +69,12 @@ export async function getBuyQuote(usdcAmount: number): Promise<QuoteResult> {
     outputMint:  TOKEN_MINT,
     amount:      rawUsdc.toString(),
     slippageBps: MAX_SLIPPAGE_BPS.toString(),
+    restrictIntermediateTokens: "true",
   });
 
-  const res = await fetch(`${JUPITER_QUOTE_URL}?${params}`);
+  const res = await fetch(`${JUPITER_BASE}/quote?${params}`, {
+    headers: jupiterHeaders(),
+  });
   if (!res.ok) throw new Error(`Jupiter buy quote failed: ${res.status}`);
   const data = await res.json();
 
@@ -80,9 +98,12 @@ export async function getSellQuote(tokenAmount: number): Promise<QuoteResult> {
     outputMint:  USDC_MINT,
     amount:      rawToken.toString(),
     slippageBps: MAX_SLIPPAGE_BPS.toString(),
+    restrictIntermediateTokens: "true",
   });
 
-  const res = await fetch(`${JUPITER_QUOTE_URL}?${params}`);
+  const res = await fetch(`${JUPITER_BASE}/quote?${params}`, {
+    headers: jupiterHeaders(),
+  });
   if (!res.ok) throw new Error(`Jupiter sell quote failed: ${res.status}`);
   const data = await res.json();
 
@@ -104,9 +125,9 @@ export async function getSwapTransaction(
   quoteResponse: any,
   userPublicKey: string,
 ): Promise<string> {
-  const res = await fetch(JUPITER_SWAP_URL, {
+  const res = await fetch(`${JUPITER_BASE}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...jupiterHeaders() },
     body: JSON.stringify({
       quoteResponse,
       userPublicKey,

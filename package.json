@@ -1,0 +1,20 @@
+{
+  "name": "token-surfer-v6",
+  "version": "1.0.0",
+  "description": "Token-agnostic V6 mean-reversion dip-buying bot for Solana SPL tokens",
+  "type": "module",
+  "main": "dist/runtime.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/runtime.js",
+    "dev": "tsc && node dist/runtime.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}

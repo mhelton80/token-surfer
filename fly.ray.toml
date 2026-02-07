@@ -30,8 +30,8 @@ primary_region = "iad"
   MAX_SLIPPAGE_BPS = "75"
   COINGECKO_ID = "raydium"
   SOLANA_CLUSTER = "mainnet-beta"
-  ENABLE_SWAPS = "false"
-  ALLOW_MAINNET_SWAPS = "false"
+  ENABLE_SWAPS = "true"
+  ALLOW_MAINNET_SWAPS = "true"
   DATA_DIR = "/data"
 
 [http_service]

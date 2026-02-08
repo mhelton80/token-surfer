@@ -124,6 +124,19 @@ async function init(): Promise<void> {
   }
 
   console.log(`[INIT] Ready. ${strategy.bars.length} bars loaded. Warmup: ${strategy.getIndicators().ready ? "✓" : "pending"}`);
+  
+  // Debug: log first/last bars and ATR sanity check
+  if (strategy.bars.length > 0) {
+    const bars = strategy.bars;
+    const first = bars[0];
+    const last = bars[bars.length - 1];
+    console.log(`[INIT] First bar: ${new Date(first.t * 1000).toISOString()} O=${first.o} H=${first.h} L=${first.l} C=${first.c} range=${(first.h - first.l).toFixed(6)}`);
+    console.log(`[INIT] Last bar:  ${new Date(last.t * 1000).toISOString()} O=${last.o} H=${last.h} L=${last.l} C=${last.c} range=${(last.h - last.l).toFixed(6)}`);
+    const ind = strategy.getIndicators();
+    if (ind.ready) {
+      console.log(`[INIT] Indicators: emaFast=${ind.emaFast.toFixed(4)} emaSlow=${ind.emaSlow.toFixed(4)} ATR=${ind.atr.toFixed(6)} slope=${ind.slope.toFixed(4)} zone=${ind.buyZoneTop.toFixed(4)}`);
+    }
+  }
 }
 
 
@@ -507,6 +520,34 @@ function startHttpServer(): void {
       await executeSell("timeout");
       res.writeHead(200);
       res.end(JSON.stringify({ message: "position closed", ...strategy.getState() }));
+      return;
+    }
+
+    // ── Debug: inspect raw bars ──
+    if (url.pathname === "/debug/bars") {
+      const bars = strategy.bars;
+      const n = bars.length;
+      const first5 = bars.slice(0, 5);
+      const last5 = bars.slice(-5);
+      const ind = strategy.getIndicators();
+      // Compute what ATR *should* be from last 14 bars
+      let manualTRs: number[] = [];
+      for (let i = Math.max(1, n - 14); i < n; i++) {
+        const b = bars[i], prev = bars[i - 1];
+        const tr = Math.max(b.h - b.l, Math.abs(b.h - prev.c), Math.abs(b.l - prev.c));
+        manualTRs.push(tr);
+      }
+      const manualATR = manualTRs.length > 0 ? manualTRs.reduce((a, b) => a + b, 0) / manualTRs.length : 0;
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        totalBars: n,
+        first5: first5.map(b => ({ ...b, date: new Date(b.t * 1000).toISOString(), range: (b.h - b.l).toFixed(6) })),
+        last5: last5.map(b => ({ ...b, date: new Date(b.t * 1000).toISOString(), range: (b.h - b.l).toFixed(6) })),
+        computedATR: ind.atr,
+        manualATR14: manualATR,
+        emaFast: ind.emaFast,
+        emaSlow: ind.emaSlow,
+      }, null, 2));
       return;
     }
 

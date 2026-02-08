@@ -106,20 +106,77 @@ async function init(): Promise<void> {
   if (strategy.bars.length < 60) {
     console.log(`[INIT] Backfilling from CoinGecko (${COINGECKO_ID})...`);
     try {
-      const history = await fetchCoinGeckoHistory(COINGECKO_ID, 14);
-      if (history.length > 0) {
-        const existingTimes = new Set(strategy.bars.map((b) => b.t));
-        let added = 0;
-        for (const bar of history) {
-          if (!existingTimes.has(bar.t)) {
-            strategy.addBar(bar);
-            added++;
-          }
+      const history = await fetchCoinGeckoHistory(COINGECKO_ID, 4);
+      if (history.length >= 2) {
+        // Validate CoinGecko bar interval matches our BAR_MS
+        const intervals = [];
+        for (let i = 1; i < Math.min(history.length, 10); i++) {
+          intervals.push((history[i].t - history[i - 1].t) * 1000);
         }
-        console.log(`[INIT] CoinGecko: added ${added} bars (total: ${strategy.bars.length})`);
+        const medianInterval = intervals.sort((a, b) => a - b)[Math.floor(intervals.length / 2)];
+        const expectedMs = BAR_MS;
+        
+        if (Math.abs(medianInterval - expectedMs) > expectedMs * 0.5) {
+          console.warn(`[INIT] CoinGecko bars are ${medianInterval / 3600000}H intervals, expected ${expectedMs / 3600000}H. Skipping backfill.`);
+        } else {
+          const existingTimes = new Set(strategy.bars.map((b) => b.t));
+          let added = 0;
+          for (const bar of history) {
+            if (!existingTimes.has(bar.t)) {
+              strategy.addBar(bar);
+              added++;
+            }
+          }
+          console.log(`[INIT] CoinGecko: added ${added} bars (total: ${strategy.bars.length})`);
+        }
       }
     } catch (err) {
       console.warn(`[INIT] CoinGecko backfill failed: ${err}. Continuing with ${strategy.bars.length} bars.`);
+    }
+  }
+  
+  // Validate persisted bars: filter out bars that don't match expected interval
+  if (strategy.bars.length > 2) {
+    const bars = strategy.bars;
+    const expectedSec = BAR_MS / 1000;
+    const tolerance = expectedSec * 0.25;  // 15min tolerance for 1H bars
+    
+    // Find the longest run of consecutive bars with correct spacing
+    let bestRunStart = bars.length - 1;
+    let bestRunLen = 1;
+    let runStart = bars.length - 1;
+    let runLen = 1;
+    
+    for (let i = bars.length - 2; i >= 0; i--) {
+      const gap = bars[i + 1].t - bars[i].t;
+      if (Math.abs(gap - expectedSec) <= tolerance) {
+        runLen++;
+        runStart = i;
+      } else {
+        if (runLen > bestRunLen) {
+          bestRunLen = runLen;
+          bestRunStart = runStart;
+        }
+        runLen = 1;
+        runStart = i;
+      }
+    }
+    if (runLen > bestRunLen) {
+      bestRunLen = runLen;
+      bestRunStart = runStart;
+    }
+    
+    if (bestRunLen < bars.length) {
+      const cleaned = bars.slice(bestRunStart, bestRunStart + bestRunLen);
+      console.warn(`[INIT] Filtered bars: kept ${cleaned.length}/${bars.length} (longest ${expectedSec/3600}H run from ${new Date(cleaned[0].t*1000).toISOString()})`);
+      // Rebuild strategy with clean bars
+      strategy.bars = [];
+      strategy.emaFastArr = [];
+      strategy.emaSlowArr = [];
+      strategy.atrArr = [];
+      for (const bar of cleaned) {
+        strategy.addBar(bar);
+      }
     }
   }
 
@@ -501,6 +558,25 @@ function startHttpServer(): void {
       persistState();
       res.writeHead(200);
       res.end(JSON.stringify({ saved: true }));
+      return;
+    }
+
+    // ── Admin: reset bars (clear persisted data) ──
+    if (url.pathname === "/admin/reset-bars" && req.method === "POST") {
+      const token = req.headers["x-admin-token"] ?? url.searchParams.get("token");
+      if (ADMIN_TOKEN && token !== ADMIN_TOKEN) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      const oldCount = strategy.bars.length;
+      strategy.bars = [];
+      strategy.emaFastArr = [];
+      strategy.emaSlowArr = [];
+      strategy.atrArr = [];
+      saveBars([]);
+      res.writeHead(200);
+      res.end(JSON.stringify({ message: `Cleared ${oldCount} bars. Bot will rebuild from live polling.` }));
       return;
     }
 

@@ -152,22 +152,48 @@ export async function getSwapTransaction(
  */
 export async function fetchCoinGeckoHistory(
   coingeckoId: string,
-  days: number = 14,
+  days: number = 4,
 ): Promise<Array<{ t: number; o: number; h: number; l: number; c: number }>> {
-  const url = `https://api.coingecko.com/api/v3/coins/${coingeckoId}/ohlc?vs_currency=usd&days=${days}`;
+  // Use market_chart endpoint: days=3-90 returns ~hourly price points
+  // We bucket these into proper 1H OHLC bars
+  const url = `https://api.coingecko.com/api/v3/coins/${coingeckoId}/market_chart?vs_currency=usd&days=${days}`;
   const res = await fetch(url);
   if (!res.ok) {
     console.warn(`[CoinGecko] Backfill failed: ${res.status}. Starting cold.`);
     return [];
   }
-  const data: number[][] = await res.json();
+  const data = await res.json();
+  const prices: [number, number][] = data.prices; // [timestamp_ms, price]
+
+  if (!prices || prices.length < 2) return [];
+
+  // Bucket into 1H bars
+  const barMs = 3_600_000;
+  const buckets = new Map<number, number[]>();
+  for (const [tsMs, price] of prices) {
+    const bucketStart = Math.floor(tsMs / barMs) * barMs;
+    if (!buckets.has(bucketStart)) buckets.set(bucketStart, []);
+    buckets.get(bucketStart)!.push(price);
+  }
+
+  // Convert buckets to OHLC bars (sorted by time)
+  const bars: Array<{ t: number; o: number; h: number; l: number; c: number }> = [];
+  const sortedKeys = [...buckets.keys()].sort((a, b) => a - b);
+  for (const ts of sortedKeys) {
+    const ticks = buckets.get(ts)!;
+    if (ticks.length === 0) continue;
+    bars.push({
+      t: Math.floor(ts / 1000), // ms → seconds
+      o: ticks[0],
+      h: Math.max(...ticks),
+      l: Math.min(...ticks),
+      c: ticks[ticks.length - 1],
+    });
+  }
+
+  // Drop the last (incomplete) bar
+  if (bars.length > 1) bars.pop();
   
-  // CoinGecko returns [timestamp, open, high, low, close]
-  return data.map((d) => ({
-    t: Math.floor(d[0] / 1000),   // ms → seconds
-    o: d[1],
-    h: d[2],
-    l: d[3],
-    c: d[4],
-  }));
+  console.log(`[CoinGecko] Built ${bars.length} 1H bars from ${prices.length} price points (${days}d)`);
+  return bars;
 }

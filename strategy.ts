@@ -87,6 +87,27 @@ export class Strategy {
    * Call this once per bar period.
    */
   addBar(bar: Bar): void {
+    // Spike filter: reject bars with obviously corrupted OHLC
+    if (this.bars.length > 0) {
+      const prevClose = this.bars[this.bars.length - 1].c;
+      const maxPrice = prevClose * 3;   // 3x previous close = clearly corrupted
+      const minPrice = prevClose * 0.33;
+      if (bar.h > maxPrice || bar.l < minPrice || bar.o > maxPrice || bar.c > maxPrice) {
+        console.warn(
+          `[SPIKE] Rejected bar ${new Date(bar.t * 1000).toISOString()}: ` +
+          `O=${bar.o} H=${bar.h} L=${bar.l} C=${bar.c} (prev.c=${prevClose.toFixed(6)})`
+        );
+        // Clamp to sane values instead of dropping entirely (preserves bar count)
+        bar = {
+          t: bar.t,
+          o: Math.min(Math.max(bar.o, minPrice), maxPrice),
+          h: Math.min(Math.max(bar.h, minPrice), maxPrice),
+          l: Math.min(Math.max(bar.l, minPrice), maxPrice),
+          c: Math.min(Math.max(bar.c, minPrice), maxPrice),
+        };
+      }
+    }
+    
     this.bars.push(bar);
     const n = this.bars.length;
     

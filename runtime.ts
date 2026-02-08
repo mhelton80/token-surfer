@@ -530,23 +530,48 @@ function startHttpServer(): void {
       const first5 = bars.slice(0, 5);
       const last5 = bars.slice(-5);
       const ind = strategy.getIndicators();
-      // Compute what ATR *should* be from last 14 bars
-      let manualTRs: number[] = [];
-      for (let i = Math.max(1, n - 14); i < n; i++) {
-        const b = bars[i], prev = bars[i - 1];
-        const tr = Math.max(b.h - b.l, Math.abs(b.h - prev.c), Math.abs(b.l - prev.c));
-        manualTRs.push(tr);
+      
+      // Compute TRs for ALL bars and find outliers
+      let allTRs: { idx: number; tr: number; bar: any }[] = [];
+      for (let i = 0; i < n; i++) {
+        const b = bars[i];
+        let tr: number;
+        if (i === 0) {
+          tr = b.h - b.l;
+        } else {
+          const prev = bars[i - 1];
+          tr = Math.max(b.h - b.l, Math.abs(b.h - prev.c), Math.abs(b.l - prev.c));
+        }
+        allTRs.push({ idx: i, tr, bar: { t: b.t, date: new Date(b.t * 1000).toISOString(), o: b.o, h: b.h, l: b.l, c: b.c } });
       }
-      const manualATR = manualTRs.length > 0 ? manualTRs.reduce((a, b) => a + b, 0) / manualTRs.length : 0;
+      
+      // Sort by TR descending — show top 10 outliers
+      const outliers = [...allTRs].sort((a, b) => b.tr - a.tr).slice(0, 10);
+      
+      // Correct manual ATR from last 14 raw TRs
+      const last14TRs = allTRs.slice(-14).map(x => x.tr);
+      const manualATR14 = last14TRs.reduce((a, b) => a + b, 0) / last14TRs.length;
+      
+      // Check bar timestamps for gaps
+      const gaps: any[] = [];
+      for (let i = 1; i < n; i++) {
+        const dt = bars[i].t - bars[i - 1].t;
+        if (dt > 7200) {  // > 2 hours gap
+          gaps.push({ from: i - 1, to: i, gapHours: (dt / 3600).toFixed(1), fromDate: new Date(bars[i-1].t*1000).toISOString(), toDate: new Date(bars[i].t*1000).toISOString() });
+        }
+      }
+      
       res.writeHead(200);
       res.end(JSON.stringify({
         totalBars: n,
         first5: first5.map(b => ({ ...b, date: new Date(b.t * 1000).toISOString(), range: (b.h - b.l).toFixed(6) })),
         last5: last5.map(b => ({ ...b, date: new Date(b.t * 1000).toISOString(), range: (b.h - b.l).toFixed(6) })),
         computedATR: ind.atr,
-        manualATR14: manualATR,
+        manualATR14,
         emaFast: ind.emaFast,
         emaSlow: ind.emaSlow,
+        top10outlierTRs: outliers,
+        timestampGaps: gaps,
       }, null, 2));
       return;
     }

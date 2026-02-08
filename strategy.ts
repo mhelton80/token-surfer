@@ -117,9 +117,16 @@ export class Strategy {
         Math.abs(bar.l - prev.c),
       );
       if (n <= ATR_LEN) {
-        // Simple average until we have enough bars
-        const sum = this.atrArr.reduce((a, b) => a + b, 0) + tr;
-        this.atrArr.push(sum / n);
+        // Simple average: recompute from raw bars (not from atrArr which holds averages)
+        let trSum = this.bars[0].h - this.bars[0].l;
+        for (let i = 1; i < n; i++) {
+          trSum += Math.max(
+            this.bars[i].h - this.bars[i].l,
+            Math.abs(this.bars[i].h - this.bars[i - 1].c),
+            Math.abs(this.bars[i].l - this.bars[i - 1].c),
+          );
+        }
+        this.atrArr.push(trSum / n);
       } else {
         // Wilder's smoothing
         const prevAtr = this.atrArr[n - 2];

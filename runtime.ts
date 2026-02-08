@@ -102,40 +102,7 @@ async function init(): Promise<void> {
     strategy.maxDrawdown = savedState.maxDrawdown;
   }
 
-  // CoinGecko backfill if we need more bars
-  if (strategy.bars.length < 60) {
-    console.log(`[INIT] Backfilling from CoinGecko (${COINGECKO_ID})...`);
-    try {
-      const history = await fetchCoinGeckoHistory(COINGECKO_ID, 4);
-      if (history.length >= 2) {
-        // Validate CoinGecko bar interval matches our BAR_MS
-        const intervals = [];
-        for (let i = 1; i < Math.min(history.length, 10); i++) {
-          intervals.push((history[i].t - history[i - 1].t) * 1000);
-        }
-        const medianInterval = intervals.sort((a, b) => a - b)[Math.floor(intervals.length / 2)];
-        const expectedMs = BAR_MS;
-        
-        if (Math.abs(medianInterval - expectedMs) > expectedMs * 0.5) {
-          console.warn(`[INIT] CoinGecko bars are ${medianInterval / 3600000}H intervals, expected ${expectedMs / 3600000}H. Skipping backfill.`);
-        } else {
-          const existingTimes = new Set(strategy.bars.map((b) => b.t));
-          let added = 0;
-          for (const bar of history) {
-            if (!existingTimes.has(bar.t)) {
-              strategy.addBar(bar);
-              added++;
-            }
-          }
-          console.log(`[INIT] CoinGecko: added ${added} bars (total: ${strategy.bars.length})`);
-        }
-      }
-    } catch (err) {
-      console.warn(`[INIT] CoinGecko backfill failed: ${err}. Continuing with ${strategy.bars.length} bars.`);
-    }
-  }
-  
-  // Validate persisted bars: filter out bars that don't match expected interval
+  // Step 1: Validate persisted bars — filter out wrong-timeframe bars
   if (strategy.bars.length > 2) {
     const bars = strategy.bars;
     const expectedSec = BAR_MS / 1000;
@@ -177,6 +144,55 @@ async function init(): Promise<void> {
       for (const bar of cleaned) {
         strategy.addBar(bar);
       }
+      // Save cleaned bars to disk so next restart is clean
+      saveBars(strategy.bars);
+    }
+  }
+
+  // Step 2: CoinGecko backfill if we need more bars after filtering
+  if (strategy.bars.length < 60) {
+    console.log(`[INIT] Backfilling from CoinGecko (${COINGECKO_ID})... (have ${strategy.bars.length} bars, need 60)`);
+    try {
+      const history = await fetchCoinGeckoHistory(COINGECKO_ID, 4);
+      if (history.length >= 2) {
+        // Validate CoinGecko bar interval matches our BAR_MS
+        const intervals = [];
+        for (let i = 1; i < Math.min(history.length, 10); i++) {
+          intervals.push((history[i].t - history[i - 1].t) * 1000);
+        }
+        const medianInterval = intervals.sort((a, b) => a - b)[Math.floor(intervals.length / 2)];
+        const expectedMs = BAR_MS;
+        
+        if (Math.abs(medianInterval - expectedMs) > expectedMs * 0.5) {
+          console.warn(`[INIT] CoinGecko bars are ${medianInterval / 3600000}H intervals, expected ${expectedMs / 3600000}H. Skipping backfill.`);
+        } else {
+          const existingTimes = new Set(strategy.bars.map((b) => b.t));
+          let added = 0;
+          // Sort history by time, merge with existing bars
+          const allBars = [...strategy.bars];
+          for (const bar of history) {
+            if (!existingTimes.has(bar.t)) {
+              allBars.push(bar);
+              added++;
+            }
+          }
+          if (added > 0) {
+            // Sort all bars by time and rebuild strategy
+            allBars.sort((a, b) => a.t - b.t);
+            strategy.bars = [];
+            strategy.emaFastArr = [];
+            strategy.emaSlowArr = [];
+            strategy.atrArr = [];
+            for (const bar of allBars) {
+              strategy.addBar(bar);
+            }
+            saveBars(strategy.bars);
+            console.log(`[INIT] CoinGecko: added ${added} bars (total: ${strategy.bars.length})`);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[INIT] CoinGecko backfill failed: ${err}. Continuing with ${strategy.bars.length} bars.`);
     }
   }
 

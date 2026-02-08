@@ -90,8 +90,8 @@ export class Strategy {
     // Spike filter: reject bars with obviously corrupted OHLC
     if (this.bars.length > 0) {
       const prevClose = this.bars[this.bars.length - 1].c;
-      const maxPrice = prevClose * 3;   // 3x previous close = clearly corrupted
-      const minPrice = prevClose * 0.33;
+      const maxPrice = prevClose * 1.5;   // 50% move in 1 bar = clearly corrupted
+      const minPrice = prevClose * 0.5;
       if (bar.h > maxPrice || bar.l < minPrice || bar.o > maxPrice || bar.c > maxPrice) {
         console.warn(
           `[SPIKE] Rejected bar ${new Date(bar.t * 1000).toISOString()}: ` +

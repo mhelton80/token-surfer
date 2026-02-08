@@ -97,14 +97,10 @@ export class Strategy {
           `[SPIKE] Rejected bar ${new Date(bar.t * 1000).toISOString()}: ` +
           `O=${bar.o} H=${bar.h} L=${bar.l} C=${bar.c} (prev.c=${prevClose.toFixed(6)})`
         );
-        // Clamp to sane values instead of dropping entirely (preserves bar count)
-        bar = {
-          t: bar.t,
-          o: Math.min(Math.max(bar.o, minPrice), maxPrice),
-          h: Math.min(Math.max(bar.h, minPrice), maxPrice),
-          l: Math.min(Math.max(bar.l, minPrice), maxPrice),
-          c: Math.min(Math.max(bar.c, minPrice), maxPrice),
-        };
+        // Replace with flat bar using the close (most likely correct value)
+        // This preserves bar count and timeline without polluting ATR
+        const safeClose = (bar.c >= minPrice && bar.c <= maxPrice) ? bar.c : prevClose;
+        bar = { t: bar.t, o: safeClose, h: safeClose, l: safeClose, c: safeClose };
       }
     }
     

@@ -54,6 +54,8 @@ let loopCount = 0;
 let priceErrors = 0;
 let lastSignalCheck = "";
 let startTime = Date.now();
+let lastHeartbeatHour = -1;
+let barsSinceLastLog = 0;
 
 
 // ─── Initialization ───────────────────────────────────────────
@@ -380,6 +382,15 @@ async function mainLoop(): Promise<void> {
     const curPnl = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
     const held = strategy.bars.length - 1 - pos.entryBar;
     lastSignalCheck = `HOLD: pnl=${curPnl}% bars=${held}`;
+
+    // Log position status on new bars
+    if (isNewBar) {
+      const ind = strategy.getIndicators();
+      const slopeStr = ind.ready ? (ind.slope * 100).toFixed(2) : "?";
+      console.log(
+        `[BAR] ${TOKEN_SYMBOL} $${price.toFixed(4)} | HOLD pnl=${curPnl}% held=${held}bars | slope=${slopeStr}% | entry=$${pos.entryPrice.toFixed(4)}`
+      );
+    }
   }
 
   // Check entry only on new bars (per strategy design)
@@ -403,6 +414,17 @@ async function mainLoop(): Promise<void> {
         lastSignalCheck = `COOL: ${strategy.cooldownRemaining} bars remaining`;
       }
     }
+
+    // ── Heartbeat: log on every new bar ──
+    barsSinceLastLog++;
+    const slopeDir = ind.slope >= MIN_EMA_SLOPE ? "▲" : ind.slope >= 0 ? "→" : "▼";
+    const slopeStr = (ind.slope * 100).toFixed(2);
+    const atrPct = ind.atr > 0 && price > 0 ? (ind.atr / price * 100).toFixed(1) : "?";
+    const zoneStr = ind.buyZoneTop > 0 ? `$${ind.buyZoneTop.toFixed(4)}` : "n/a";
+    const uptime = Math.floor((Date.now() - startTime) / 3600000);
+    console.log(
+      `[BAR] ${TOKEN_SYMBOL} $${price.toFixed(4)} | slope=${slopeStr}%${slopeDir} | ATR%=${atrPct}% | zone<${zoneStr} | ${lastSignalCheck} | bars=${strategy.bars.length} up=${uptime}h`
+    );
   }
 }
 

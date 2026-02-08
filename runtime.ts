@@ -1,709 +1,350 @@
 /**
- * Token-Surfer V6 — Runtime
+ * Token-Surfer V6 — Strategy Core
  * 
- * Main event loop:
- *   1. Poll price every SAMPLE_INTERVAL_MS
- *   2. Accumulate OHLC bars
- *   3. On each new bar: check entry/exit signals
- *   4. Execute swaps via Jupiter if armed
- *   5. Persist state after every trade
- *   6. Serve health/metrics via HTTP
+ * Clean mean-reversion dip-buying strategy:
+ *   Entry:  Price dips below EMA(fast) by zone × ATR, while EMA slope > threshold
+ *   Exit:   TP1 (fixed %), SL (fixed %), timeout (max bars), optional TP2/trail
+ * 
+ * No regime detection, no ML filter, no probe entries.
+ * The EMA slope filter IS the regime filter — it keeps the bot out of downtrends.
  */
 
-import * as http from "http";
 import {
-  Connection, Keypair, VersionedTransaction, PublicKey,
-} from "@solana/web3.js";
-
-import {
-  TOKEN_SYMBOL, TOKEN_UNIT, USDC_UNIT, TOKEN_MINT, USDC_MINT,
-  BAR_MS, SAMPLE_INTERVAL_MS, TRADE_PCT_USDC, MIN_SOL_RESERVE,
-  PORT, RPC_URL, KEYPAIR_JSON, ADMIN_TOKEN, SWAPS_ARMED,
-  COINGECKO_ID, BOT_NAME, printConfig, MIN_EMA_SLOPE,
+  EMA_FAST_LEN, EMA_SLOW_LEN, ATR_LEN, ZONE_ATR_MULT,
+  MIN_EMA_SLOPE, TP1_PCT, TP2_PCT, SL_PCT, TRAIL_PCT,
+  MAX_BARS_IN_POS, COOLDOWN_BARS, MAX_POSITIONS,
+  WARMUP_BARS, TOKEN_SYMBOL,
 } from "./token-config.js";
 
-import {
-  getTokenPrice, getBuyQuote, getSellQuote,
-  getSwapTransaction, fetchCoinGeckoHistory,
-} from "./jupiter.js";
+// ─── Types ────────────────────────────────────────────────────
 
-import { Strategy, Bar, ExitReason } from "./strategy.js";
-import {
-  saveState, loadState, saveBars, loadBars,
-  appendTrade, loadTrades, PersistedState,
-} from "./state-manager.js";
-
-
-// ─── Globals ──────────────────────────────────────────────────
-
-let connection: Connection;
-let wallet: Keypair;
-const strategy = new Strategy();
-
-// Current bar accumulation
-let currentBarStart = 0;
-let currentBarOpen = 0;
-let currentBarHigh = -Infinity;
-let currentBarLow = Infinity;
-let currentBarClose = 0;
-let lastPrice = 0;
-let lastPriceTime = 0;
-
-// Metrics
-let loopCount = 0;
-let priceErrors = 0;
-let lastSignalCheck = "";
-let startTime = Date.now();
-let lastHeartbeatHour = -1;
-let barsSinceLastLog = 0;
-
-
-// ─── Initialization ───────────────────────────────────────────
-
-async function init(): Promise<void> {
-  printConfig();
-
-  connection = new Connection(RPC_URL, "confirmed");
-
-  if (KEYPAIR_JSON) {
-    try {
-      const keyBytes = JSON.parse(KEYPAIR_JSON);
-      wallet = Keypair.fromSecretKey(Uint8Array.from(keyBytes));
-      console.log(`[INIT] Wallet: ${wallet.publicKey.toBase58()}`);
-    } catch (err) {
-      throw new Error(`Failed to parse AGENT_KEYPAIR_JSON: ${err}`);
-    }
-  } else if (SWAPS_ARMED) {
-    throw new Error("AGENT_KEYPAIR_JSON is required when swaps are armed");
-  } else {
-    console.log(`[INIT] No wallet configured — running in shadow/monitor mode`);
-  }
-
-  // Load persisted state
-  const savedBars = loadBars();
-  const savedState = loadState();
-
-  if (savedBars.length > 0) {
-    console.log(`[INIT] Restoring ${savedBars.length} bars from disk`);
-    for (const bar of savedBars) {
-      strategy.addBar(bar);
-    }
-  }
-
-  if (savedState) {
-    console.log(`[INIT] Restoring state: ${savedState.totalTrades} trades, equity=${savedState.equity.toFixed(4)}`);
-    strategy.position = savedState.position;
-    strategy.cooldownRemaining = savedState.cooldownRemaining;
-    strategy.totalTrades = savedState.totalTrades;
-    strategy.totalWins = savedState.totalWins;
-    strategy.totalPnlPct = savedState.totalPnlPct;
-    strategy.equity = savedState.equity;
-    strategy.peakEquity = savedState.peakEquity;
-    strategy.maxDrawdown = savedState.maxDrawdown;
-  }
-
-  // Step 1: Validate persisted bars — filter out wrong-timeframe bars
-  if (strategy.bars.length > 2) {
-    const bars = strategy.bars;
-    const expectedSec = BAR_MS / 1000;
-    const tolerance = expectedSec * 0.25;  // 15min tolerance for 1H bars
-    
-    // Find the longest run of consecutive bars with correct spacing
-    let bestRunStart = bars.length - 1;
-    let bestRunLen = 1;
-    let runStart = bars.length - 1;
-    let runLen = 1;
-    
-    for (let i = bars.length - 2; i >= 0; i--) {
-      const gap = bars[i + 1].t - bars[i].t;
-      if (Math.abs(gap - expectedSec) <= tolerance) {
-        runLen++;
-        runStart = i;
-      } else {
-        if (runLen > bestRunLen) {
-          bestRunLen = runLen;
-          bestRunStart = runStart;
-        }
-        runLen = 1;
-        runStart = i;
-      }
-    }
-    if (runLen > bestRunLen) {
-      bestRunLen = runLen;
-      bestRunStart = runStart;
-    }
-    
-    if (bestRunLen < bars.length) {
-      const cleaned = bars.slice(bestRunStart, bestRunStart + bestRunLen);
-      console.warn(`[INIT] Filtered bars: kept ${cleaned.length}/${bars.length} (longest ${expectedSec/3600}H run from ${new Date(cleaned[0].t*1000).toISOString()})`);
-      // Rebuild strategy with clean bars
-      strategy.bars = [];
-      strategy.emaFastArr = [];
-      strategy.emaSlowArr = [];
-      strategy.atrArr = [];
-      for (const bar of cleaned) {
-        strategy.addBar(bar);
-      }
-      // Save cleaned bars to disk so next restart is clean
-      saveBars(strategy.bars);
-    }
-  }
-
-  // Step 2: CoinGecko backfill if we need more bars after filtering
-  if (strategy.bars.length < 60) {
-    console.log(`[INIT] Backfilling from CoinGecko (${COINGECKO_ID})... (have ${strategy.bars.length} bars, need 60)`);
-    try {
-      const history = await fetchCoinGeckoHistory(COINGECKO_ID, 4);
-      if (history.length >= 2) {
-        // Validate CoinGecko bar interval matches our BAR_MS
-        const intervals = [];
-        for (let i = 1; i < Math.min(history.length, 10); i++) {
-          intervals.push((history[i].t - history[i - 1].t) * 1000);
-        }
-        const medianInterval = intervals.sort((a, b) => a - b)[Math.floor(intervals.length / 2)];
-        const expectedMs = BAR_MS;
-        
-        if (Math.abs(medianInterval - expectedMs) > expectedMs * 0.5) {
-          console.warn(`[INIT] CoinGecko bars are ${medianInterval / 3600000}H intervals, expected ${expectedMs / 3600000}H. Skipping backfill.`);
-        } else {
-          const existingTimes = new Set(strategy.bars.map((b) => b.t));
-          let added = 0;
-          // Sort history by time, merge with existing bars
-          const allBars = [...strategy.bars];
-          for (const bar of history) {
-            if (!existingTimes.has(bar.t)) {
-              allBars.push(bar);
-              added++;
-            }
-          }
-          if (added > 0) {
-            // Sort all bars by time and rebuild strategy
-            allBars.sort((a, b) => a.t - b.t);
-            strategy.bars = [];
-            strategy.emaFastArr = [];
-            strategy.emaSlowArr = [];
-            strategy.atrArr = [];
-            for (const bar of allBars) {
-              strategy.addBar(bar);
-            }
-            saveBars(strategy.bars);
-            console.log(`[INIT] CoinGecko: added ${added} bars (total: ${strategy.bars.length})`);
-          }
-        }
-      }
-    } catch (err) {
-      console.warn(`[INIT] CoinGecko backfill failed: ${err}. Continuing with ${strategy.bars.length} bars.`);
-    }
-  }
-
-  console.log(`[INIT] Ready. ${strategy.bars.length} bars loaded. Warmup: ${strategy.getIndicators().ready ? "✓" : "pending"}`);
-  
-  // Debug: log first/last bars and ATR sanity check
-  if (strategy.bars.length > 0) {
-    const bars = strategy.bars;
-    const first = bars[0];
-    const last = bars[bars.length - 1];
-    console.log(`[INIT] First bar: ${new Date(first.t * 1000).toISOString()} O=${first.o} H=${first.h} L=${first.l} C=${first.c} range=${(first.h - first.l).toFixed(6)}`);
-    console.log(`[INIT] Last bar:  ${new Date(last.t * 1000).toISOString()} O=${last.o} H=${last.h} L=${last.l} C=${last.c} range=${(last.h - last.l).toFixed(6)}`);
-    const ind = strategy.getIndicators();
-    if (ind.ready) {
-      console.log(`[INIT] Indicators: emaFast=${ind.emaFast.toFixed(4)} emaSlow=${ind.emaSlow.toFixed(4)} ATR=${ind.atr.toFixed(6)} slope=${ind.slope.toFixed(4)} zone=${ind.buyZoneTop.toFixed(4)}`);
-    }
-  }
+export interface Bar {
+  t: number;  // unix timestamp (seconds)
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v?: number;
 }
 
+export interface Position {
+  entryPrice: number;
+  entryBar: number;      // index into bars array
+  entryTime: number;     // unix timestamp
+  highSinceEntry: number;
+  tokenAmount: number;   // raw amount of token bought
+  usdcSpent: number;     // USDC spent to buy
+  txSignature?: string;  // buy tx signature
+}
 
-// ─── Price Polling & Bar Building ─────────────────────────────
+export type ExitReason = "tp1" | "tp2" | "trail" | "sl" | "timeout";
 
-async function pollPrice(): Promise<number | null> {
-  try {
-    const price = await getTokenPrice();
-    lastPrice = price;
-    lastPriceTime = Date.now();
-    return price;
-  } catch (err) {
-    priceErrors++;
-    if (priceErrors % 10 === 1) {
-      console.warn(`[PRICE] Error #${priceErrors}: ${err}`);
+export interface ExitSignal {
+  reason: ExitReason;
+  pnlPct: number;
+  barsHeld: number;
+}
+
+export interface EntrySignal {
+  price: number;
+  emaFast: number;
+  emaSlow: number;
+  atr: number;
+  slope: number;
+  zoneDepth: number;   // how far below zone top (in ATR units)
+}
+
+export interface Indicators {
+  emaFast: number;
+  emaSlow: number;
+  atr: number;
+  slope: number;       // (emaFast - emaSlow) / emaSlow
+  buyZoneTop: number;  // emaFast - zone * ATR
+  ready: boolean;      // enough bars for warmup
+}
+
+// ─── Indicator Computation ────────────────────────────────────
+
+export class Strategy {
+  bars: Bar[] = [];
+  emaFastArr: number[] = [];
+  emaSlowArr: number[] = [];
+  atrArr: number[] = [];
+  
+  cooldownRemaining = 0;
+  position: Position | null = null;
+  
+  // Cumulative stats
+  totalTrades = 0;
+  totalWins = 0;
+  totalPnlPct = 0;
+  peakEquity = 1;
+  equity = 1;
+  maxDrawdown = 0;
+  
+  /**
+   * Add a new bar and recompute indicators.
+   * Call this once per bar period.
+   */
+  addBar(bar: Bar): void {
+    // Spike filter: reject bars with obviously corrupted OHLC
+    if (this.bars.length > 0) {
+      const prevClose = this.bars[this.bars.length - 1].c;
+      const maxPrice = prevClose * 1.5;   // 50% move in 1 bar = clearly corrupted
+      const minPrice = prevClose * 0.5;
+      if (bar.h > maxPrice || bar.l < minPrice || bar.o > maxPrice || bar.c > maxPrice) {
+        console.warn(
+          `[SPIKE] Rejected bar ${new Date(bar.t * 1000).toISOString()}: ` +
+          `O=${bar.o} H=${bar.h} L=${bar.l} C=${bar.c} (prev.c=${prevClose.toFixed(6)})`
+        );
+        // Replace with flat bar using the close (most likely correct value)
+        // This preserves bar count and timeline without polluting ATR
+        const safeClose = (bar.c >= minPrice && bar.c <= maxPrice) ? bar.c : prevClose;
+        bar = { t: bar.t, o: safeClose, h: safeClose, l: safeClose, c: safeClose };
+      }
     }
+    
+    this.bars.push(bar);
+    const n = this.bars.length;
+    
+    // EMA fast
+    if (n === 1) {
+      this.emaFastArr.push(bar.c);
+    } else {
+      const k = 2 / (EMA_FAST_LEN + 1);
+      this.emaFastArr.push(bar.c * k + this.emaFastArr[n - 2] * (1 - k));
+    }
+    
+    // EMA slow
+    if (n === 1) {
+      this.emaSlowArr.push(bar.c);
+    } else {
+      const k = 2 / (EMA_SLOW_LEN + 1);
+      this.emaSlowArr.push(bar.c * k + this.emaSlowArr[n - 2] * (1 - k));
+    }
+    
+    // ATR
+    if (n === 1) {
+      this.atrArr.push(bar.h - bar.l);
+    } else {
+      const prev = this.bars[n - 2];
+      const tr = Math.max(
+        bar.h - bar.l,
+        Math.abs(bar.h - prev.c),
+        Math.abs(bar.l - prev.c),
+      );
+      if (n <= ATR_LEN) {
+        // Simple average: recompute from raw bars (not from atrArr which holds averages)
+        let trSum = this.bars[0].h - this.bars[0].l;
+        for (let i = 1; i < n; i++) {
+          trSum += Math.max(
+            this.bars[i].h - this.bars[i].l,
+            Math.abs(this.bars[i].h - this.bars[i - 1].c),
+            Math.abs(this.bars[i].l - this.bars[i - 1].c),
+          );
+        }
+        this.atrArr.push(trSum / n);
+      } else {
+        // Wilder's smoothing
+        const prevAtr = this.atrArr[n - 2];
+        this.atrArr.push((prevAtr * (ATR_LEN - 1) + tr) / ATR_LEN);
+      }
+    }
+    
+    // Tick cooldown
+    if (this.cooldownRemaining > 0) {
+      this.cooldownRemaining--;
+    }
+  }
+  
+  /**
+   * Get current indicator values.
+   */
+  getIndicators(): Indicators {
+    const n = this.bars.length;
+    if (n === 0) {
+      return { emaFast: 0, emaSlow: 0, atr: 0, slope: 0, buyZoneTop: 0, ready: false };
+    }
+    
+    const emaFast = this.emaFastArr[n - 1];
+    const emaSlow = this.emaSlowArr[n - 1];
+    const atr     = this.atrArr[n - 1];
+    const slope   = emaSlow > 0 ? (emaFast - emaSlow) / emaSlow : 0;
+    const buyZoneTop = emaFast - atr * ZONE_ATR_MULT;
+    
+    return {
+      emaFast, emaSlow, atr, slope, buyZoneTop,
+      ready: n >= WARMUP_BARS,
+    };
+  }
+  
+  /**
+   * Check if we should enter a position.
+   * Returns EntrySignal if yes, null if no.
+   */
+  checkEntry(currentPrice: number): EntrySignal | null {
+    const ind = this.getIndicators();
+    if (!ind.ready) return null;
+    if (this.position !== null) return null;
+    if (this.cooldownRemaining > 0) return null;
+    
+    // Slope gate: must be in uptrend
+    if (ind.slope < MIN_EMA_SLOPE) return null;
+    
+    // Zone gate: price must be below buy zone
+    if (currentPrice > ind.buyZoneTop) return null;
+    
+    // ATR sanity check
+    if (ind.atr <= 0) return null;
+    
+    const zoneDepth = (ind.buyZoneTop - currentPrice) / ind.atr;
+    
+    return {
+      price: currentPrice,
+      emaFast: ind.emaFast,
+      emaSlow: ind.emaSlow,
+      atr: ind.atr,
+      slope: ind.slope,
+      zoneDepth,
+    };
+  }
+  
+  /**
+   * Open a position after entry signal confirmed.
+   */
+  openPosition(entryPrice: number, tokenAmount: number, usdcSpent: number, txSig?: string): void {
+    const n = this.bars.length;
+    this.position = {
+      entryPrice,
+      entryBar: n - 1,
+      entryTime: this.bars[n - 1]?.t ?? Math.floor(Date.now() / 1000),
+      highSinceEntry: entryPrice,
+      tokenAmount,
+      usdcSpent,
+      txSignature: txSig,
+    };
+    console.log(`[ENTRY] ${TOKEN_SYMBOL} @ $${entryPrice.toFixed(4)} | ${tokenAmount.toFixed(2)} tokens | $${usdcSpent.toFixed(2)} USDC`);
+  }
+  
+  /**
+   * Check if we should exit the current position.
+   * Returns ExitSignal if yes, null if no.
+   */
+  checkExit(currentPrice: number): ExitSignal | null {
+    if (!this.position) return null;
+    
+    const pos = this.position;
+    const barsHeld = this.bars.length - 1 - pos.entryBar;
+    const pnlPct = (currentPrice - pos.entryPrice) / pos.entryPrice;
+    
+    // Update high watermark
+    if (currentPrice > pos.highSinceEntry) {
+      pos.highSinceEntry = currentPrice;
+    }
+    
+    // TP2 check (if enabled)
+    if (TP2_PCT > 0 && pnlPct >= TP2_PCT) {
+      return { reason: "tp2", pnlPct, barsHeld };
+    }
+    
+    // TP1 check
+    if (pnlPct >= TP1_PCT) {
+      // If trailing stop enabled, wait for trail trigger
+      if (TRAIL_PCT > 0) {
+        const drawdownFromHigh = (pos.highSinceEntry - currentPrice) / pos.highSinceEntry;
+        if (drawdownFromHigh >= TRAIL_PCT) {
+          return { reason: "trail", pnlPct, barsHeld };
+        }
+        // TP1 reached but trail not triggered — hold
+        return null;
+      }
+      return { reason: "tp1", pnlPct, barsHeld };
+    }
+    
+    // Stop loss
+    if (pnlPct <= -SL_PCT) {
+      return { reason: "sl", pnlPct, barsHeld };
+    }
+    
+    // Timeout
+    if (barsHeld >= MAX_BARS_IN_POS) {
+      return { reason: "timeout", pnlPct, barsHeld };
+    }
+    
     return null;
   }
-}
-
-function processPrice(price: number, now: number): boolean {
-  const barStart = Math.floor(now / BAR_MS) * BAR_MS;
-
-  if (barStart === currentBarStart) {
-    if (price > currentBarHigh) currentBarHigh = price;
-    if (price < currentBarLow) currentBarLow = price;
-    currentBarClose = price;
-    return false;
-  }
-
-  // New bar — close previous if it existed
-  let newBar = false;
-  if (currentBarStart > 0 && currentBarClose > 0) {
-    const bar: Bar = {
-      t: Math.floor(currentBarStart / 1000),
-      o: currentBarOpen,
-      h: currentBarHigh,
-      l: currentBarLow,
-      c: currentBarClose,
-    };
-    strategy.addBar(bar);
-    newBar = true;
-
-    if (strategy.bars.length % 10 === 0) {
-      saveBars(strategy.bars);
-    }
-  }
-
-  currentBarStart = barStart;
-  currentBarOpen = price;
-  currentBarHigh = price;
-  currentBarLow = price;
-  currentBarClose = price;
-
-  return newBar;
-}
-
-
-// ─── Trade Execution ──────────────────────────────────────────
-
-async function getUsdcBalance(): Promise<number> {
-  try {
-    const resp = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
-      mint: new PublicKey(USDC_MINT),
-    });
-    if (resp.value.length === 0) return 0;
-    return resp.value[0].account.data.parsed.info.tokenAmount.uiAmount ?? 0;
-  } catch (err) {
-    console.warn(`[BALANCE] USDC error: ${err}`);
-    return 0;
-  }
-}
-
-async function getTokenBalance(): Promise<number> {
-  try {
-    const resp = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
-      mint: new PublicKey(TOKEN_MINT),
-    });
-    if (resp.value.length === 0) return 0;
-    return resp.value[0].account.data.parsed.info.tokenAmount.uiAmount ?? 0;
-  } catch (err) {
-    console.warn(`[BALANCE] ${TOKEN_SYMBOL} error: ${err}`);
-    return 0;
-  }
-}
-
-async function executeBuy(price: number): Promise<boolean> {
-  if (!SWAPS_ARMED) {
-    console.log(`[SHADOW] Would BUY ${TOKEN_SYMBOL} @ $${price.toFixed(4)} — swaps disarmed`);
-    const shadowUsdc = 100;
-    const posSize = shadowUsdc * TRADE_PCT_USDC;
-    const estTokens = posSize / price;
-    strategy.openPosition(price, estTokens, posSize, "shadow");
-    persistState();
-    return true;
-  }
-
-  try {
-    const usdcBalance = await getUsdcBalance();
-    const positionSize = usdcBalance * TRADE_PCT_USDC;
-
-    if (positionSize < 1) {
-      console.warn(`[BUY] Insufficient USDC: $${usdcBalance.toFixed(2)}`);
-      return false;
-    }
-
-    console.log(`[BUY] Getting quote: $${positionSize.toFixed(2)} USDC → ${TOKEN_SYMBOL}...`);
-    const quote = await getBuyQuote(positionSize);
-
-    if (quote.priceImpactPct > 1.0) {
-      console.warn(`[BUY] Price impact too high: ${quote.priceImpactPct.toFixed(2)}%. Skipping.`);
-      return false;
-    }
-
-    const swapTx = await getSwapTransaction(quote.raw, wallet.publicKey.toBase58());
-    const txBuf = Buffer.from(swapTx, "base64");
-    const tx = VersionedTransaction.deserialize(txBuf);
-    tx.sign([wallet]);
-
-    const sig = await connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 3,
-    });
-    console.log(`[BUY] Tx sent: ${sig}`);
-
-    const conf = await connection.confirmTransaction(sig, "confirmed");
-    if (conf.value.err) {
-      console.error(`[BUY] Tx failed: ${JSON.stringify(conf.value.err)}`);
-      return false;
-    }
-
-    const tokensBought = Number(quote.outAmount) / TOKEN_UNIT;
-    strategy.openPosition(quote.priceUsdcPerToken, tokensBought, positionSize, sig);
-    persistState();
-    console.log(`[BUY] ✓ ${tokensBought.toFixed(2)} ${TOKEN_SYMBOL} @ $${quote.priceUsdcPerToken.toFixed(4)} | ${sig}`);
-    return true;
-  } catch (err) {
-    console.error(`[BUY] Failed: ${err}`);
-    return false;
-  }
-}
-
-async function executeSell(reason: ExitReason): Promise<boolean> {
-  if (!strategy.position) return false;
-  const pos = strategy.position;
-
-  if (!SWAPS_ARMED || pos.txSignature === "shadow") {
-    const exitPrice = lastPrice;
-    const result = strategy.closePosition(exitPrice, reason);
-    appendTrade({
-      entryTime: new Date(pos.entryTime * 1000).toISOString(),
-      exitTime: new Date().toISOString(),
-      entryPrice: pos.entryPrice,
-      exitPrice,
-      reason,
-      pnlPct: result.pnlPct,
-      pnlNet: result.pnlNet,
-      barsHeld: strategy.bars.length - 1 - pos.entryBar,
-      equityAfter: strategy.equity,
-    });
-    persistState();
-    return true;
-  }
-
-  try {
-    const tokenBalance = await getTokenBalance();
-    if (tokenBalance < 0.001) {
-      console.warn(`[SELL] No ${TOKEN_SYMBOL} balance`);
-      strategy.closePosition(lastPrice, reason);
-      persistState();
-      return false;
-    }
-
-    console.log(`[SELL] Getting quote: ${tokenBalance.toFixed(2)} ${TOKEN_SYMBOL} → USDC...`);
-    const quote = await getSellQuote(tokenBalance);
-
-    const swapTx = await getSwapTransaction(quote.raw, wallet.publicKey.toBase58());
-    const txBuf = Buffer.from(swapTx, "base64");
-    const tx = VersionedTransaction.deserialize(txBuf);
-    tx.sign([wallet]);
-
-    const sig = await connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 3,
-    });
-    console.log(`[SELL] Tx sent: ${sig}`);
-
-    const conf = await connection.confirmTransaction(sig, "confirmed");
-    if (conf.value.err) {
-      console.error(`[SELL] Tx failed: ${JSON.stringify(conf.value.err)}`);
-      return false;
-    }
-
-    const exitPrice = quote.priceUsdcPerToken;
-    const result = strategy.closePosition(exitPrice, reason);
-    appendTrade({
-      entryTime: new Date(pos.entryTime * 1000).toISOString(),
-      exitTime: new Date().toISOString(),
-      entryPrice: pos.entryPrice,
-      exitPrice,
-      reason,
-      pnlPct: result.pnlPct,
-      pnlNet: result.pnlNet,
-      barsHeld: strategy.bars.length - 1 - pos.entryBar,
-      equityAfter: strategy.equity,
-    });
-    persistState();
-    console.log(`[SELL] ✓ @ $${exitPrice.toFixed(4)} | ${reason} | ${sig}`);
-    return true;
-  } catch (err) {
-    console.error(`[SELL] Failed: ${err}`);
-    return false;
-  }
-}
-
-
-// ─── State Persistence ────────────────────────────────────────
-
-function persistState(): void {
-  saveState({
-    position: strategy.position,
-    cooldownRemaining: strategy.cooldownRemaining,
-    totalTrades: strategy.totalTrades,
-    totalWins: strategy.totalWins,
-    totalPnlPct: strategy.totalPnlPct,
-    equity: strategy.equity,
-    peakEquity: strategy.peakEquity,
-    maxDrawdown: strategy.maxDrawdown,
-    lastSaveTime: new Date().toISOString(),
-  });
-  saveBars(strategy.bars);
-}
-
-
-// ─── Main Loop ────────────────────────────────────────────────
-
-async function mainLoop(): Promise<void> {
-  loopCount++;
-
-  const price = await pollPrice();
-  if (price === null) return;
-
-  const now = Date.now();
-  const isNewBar = processPrice(price, now);
-
-  // Check exit on EVERY tick (not just new bars) for responsive SL/TP
-  if (strategy.position) {
-    const exitSignal = strategy.checkExit(price);
-    if (exitSignal) {
-      lastSignalCheck = `EXIT: ${exitSignal.reason} pnl=${(exitSignal.pnlPct * 100).toFixed(2)}%`;
-      await executeSell(exitSignal.reason);
-      return;
-    }
-
-    const pos = strategy.position;
-    const curPnl = ((price - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
-    const held = strategy.bars.length - 1 - pos.entryBar;
-    lastSignalCheck = `HOLD: pnl=${curPnl}% bars=${held}`;
-
-    // Log position status on new bars
-    if (isNewBar) {
-      const ind = strategy.getIndicators();
-      const slopeStr = ind.ready ? (ind.slope * 100).toFixed(2) : "?";
-      console.log(
-        `[BAR] ${TOKEN_SYMBOL} $${price.toFixed(4)} | HOLD pnl=${curPnl}% held=${held}bars | slope=${slopeStr}% | entry=$${pos.entryPrice.toFixed(4)}`
-      );
-    }
-  }
-
-  // Check entry only on new bars (per strategy design)
-  if (isNewBar && !strategy.position) {
-    const ind = strategy.getIndicators();
-    if (!ind.ready) {
-      lastSignalCheck = `warmup (${strategy.bars.length} bars)`;
-      return;
-    }
-
-    const entrySignal = strategy.checkEntry(price);
-    if (entrySignal) {
-      lastSignalCheck = `ENTRY: slope=${entrySignal.slope.toFixed(4)} depth=${entrySignal.zoneDepth.toFixed(2)}×ATR`;
-      await executeBuy(price);
-    } else {
-      if (ind.slope < MIN_EMA_SLOPE) {
-        lastSignalCheck = `IDLE: slope=${ind.slope.toFixed(4)} < ${MIN_EMA_SLOPE} (downtrend)`;
-      } else if (price > ind.buyZoneTop) {
-        lastSignalCheck = `WAIT: $${price.toFixed(4)} above zone $${ind.buyZoneTop.toFixed(4)}`;
-      } else if (strategy.cooldownRemaining > 0) {
-        lastSignalCheck = `COOL: ${strategy.cooldownRemaining} bars remaining`;
-      }
-    }
-
-    // ── Heartbeat: log on every new bar ──
-    barsSinceLastLog++;
-    const slopeDir = ind.slope >= MIN_EMA_SLOPE ? "▲" : ind.slope >= 0 ? "→" : "▼";
-    const slopeStr = (ind.slope * 100).toFixed(2);
-    const atrPct = ind.atr > 0 && price > 0 ? (ind.atr / price * 100).toFixed(1) : "?";
-    const zoneStr = ind.buyZoneTop > 0 ? `$${ind.buyZoneTop.toFixed(4)}` : "n/a";
-    const uptime = Math.floor((Date.now() - startTime) / 3600000);
+  
+  /**
+   * Close the position and record stats.
+   */
+  closePosition(exitPrice: number, reason: ExitReason): { pnlPct: number; pnlNet: number } {
+    if (!this.position) throw new Error("No position to close");
+    
+    const pos = this.position;
+    const pnlPct = (exitPrice - pos.entryPrice) / pos.entryPrice;
+    const feePct = 0.0004; // ~4 bps round-trip via Jupiter Metis
+    const pnlNet = pnlPct - feePct;
+    const barsHeld = this.bars.length - 1 - pos.entryBar;
+    
+    // Update equity tracking
+    this.equity *= (1 + pnlNet);
+    if (this.equity > this.peakEquity) this.peakEquity = this.equity;
+    const dd = (this.peakEquity - this.equity) / this.peakEquity;
+    if (dd > this.maxDrawdown) this.maxDrawdown = dd;
+    
+    this.totalTrades++;
+    if (pnlNet > 0) this.totalWins++;
+    this.totalPnlPct += pnlNet;
+    
     console.log(
-      `[BAR] ${TOKEN_SYMBOL} $${price.toFixed(4)} | slope=${slopeStr}%${slopeDir} | ATR%=${atrPct}% | zone<${zoneStr} | ${lastSignalCheck} | bars=${strategy.bars.length} up=${uptime}h`
+      `[EXIT] ${TOKEN_SYMBOL} @ $${exitPrice.toFixed(4)} | reason=${reason} | ` +
+      `pnl=${(pnlPct * 100).toFixed(2)}% net=${(pnlNet * 100).toFixed(2)}% | ` +
+      `held=${barsHeld} bars | equity=${this.equity.toFixed(4)} | ` +
+      `${this.totalTrades} trades, ${this.totalWins}W/${this.totalTrades - this.totalWins}L`
     );
+    
+    this.position = null;
+    this.cooldownRemaining = COOLDOWN_BARS;
+    
+    return { pnlPct, pnlNet };
+  }
+  
+  /**
+   * Get strategy state for health endpoint / persistence.
+   */
+  getState(): Record<string, any> {
+    const ind = this.getIndicators();
+    return {
+      token: TOKEN_SYMBOL,
+      barsLoaded: this.bars.length,
+      warmupComplete: ind.ready,
+      indicators: ind.ready ? {
+        emaFast: ind.emaFast.toFixed(4),
+        emaSlow: ind.emaSlow.toFixed(4),
+        atr: ind.atr.toFixed(4),
+        atrPct: ((ind.atr / (ind.emaFast || 1)) * 100).toFixed(2) + "%",
+        slope: ind.slope.toFixed(4),
+        slopeAboveThreshold: ind.slope >= MIN_EMA_SLOPE,
+        buyZoneTop: ind.buyZoneTop.toFixed(4),
+      } : null,
+      position: this.position ? {
+        entryPrice: this.position.entryPrice,
+        entryTime: new Date(this.position.entryTime * 1000).toISOString(),
+        barsHeld: this.bars.length - 1 - this.position.entryBar,
+        highSinceEntry: this.position.highSinceEntry,
+        currentPnl: this.bars.length > 0
+          ? (((this.bars[this.bars.length - 1].c - this.position.entryPrice) / this.position.entryPrice) * 100).toFixed(2) + "%"
+          : "n/a",
+      } : null,
+      cooldownRemaining: this.cooldownRemaining,
+      stats: {
+        totalTrades: this.totalTrades,
+        wins: this.totalWins,
+        winRate: this.totalTrades > 0 ? ((this.totalWins / this.totalTrades) * 100).toFixed(1) + "%" : "n/a",
+        totalPnlPct: (this.totalPnlPct * 100).toFixed(2) + "%",
+        equity: this.equity.toFixed(4),
+        maxDrawdown: (this.maxDrawdown * 100).toFixed(2) + "%",
+      },
+    };
   }
 }
-
-
-// ─── HTTP Server ──────────────────────────────────────────────
-
-function startHttpServer(): void {
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
-    res.setHeader("Content-Type", "application/json");
-
-    // ── Health ──
-    if (url.pathname === "/health" || url.pathname === "/") {
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        status: "ok",
-        bot: BOT_NAME,
-        uptime: Math.floor((Date.now() - startTime) / 1000),
-        swapsArmed: SWAPS_ARMED,
-        lastPrice: lastPrice > 0 ? lastPrice.toFixed(4) : null,
-        lastPriceAge: lastPriceTime > 0 ? Math.floor((Date.now() - lastPriceTime) / 1000) + "s" : "never",
-        lastSignal: lastSignalCheck,
-        loopCount,
-        priceErrors,
-        ...strategy.getState(),
-      }, null, 2));
-      return;
-    }
-
-    // ── Trades history ──
-    if (url.pathname === "/trades") {
-      const trades = loadTrades();
-      res.writeHead(200);
-      res.end(JSON.stringify({ count: trades.length, trades }, null, 2));
-      return;
-    }
-
-    // ── Metrics (compact) ──
-    if (url.pathname === "/metrics") {
-      const state = strategy.getState();
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        bot: BOT_NAME,
-        price: lastPrice.toFixed(4),
-        signal: lastSignalCheck,
-        bars: strategy.bars.length,
-        ...state.stats,
-        position: state.position ? "open" : "none",
-      }, null, 2));
-      return;
-    }
-
-    // ── Admin: force save ──
-    if (url.pathname === "/admin/save" && req.method === "POST") {
-      const token = req.headers["x-admin-token"] ?? url.searchParams.get("token");
-      if (ADMIN_TOKEN && token !== ADMIN_TOKEN) {
-        res.writeHead(403);
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
-      persistState();
-      res.writeHead(200);
-      res.end(JSON.stringify({ saved: true }));
-      return;
-    }
-
-    // ── Admin: reset bars (clear persisted data) ──
-    if (url.pathname === "/admin/reset-bars" && req.method === "POST") {
-      const token = req.headers["x-admin-token"] ?? url.searchParams.get("token");
-      if (ADMIN_TOKEN && token !== ADMIN_TOKEN) {
-        res.writeHead(403);
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
-      const oldCount = strategy.bars.length;
-      strategy.bars = [];
-      strategy.emaFastArr = [];
-      strategy.emaSlowArr = [];
-      strategy.atrArr = [];
-      saveBars([]);
-      res.writeHead(200);
-      res.end(JSON.stringify({ message: `Cleared ${oldCount} bars. Bot will rebuild from live polling.` }));
-      return;
-    }
-
-    // ── Admin: force close position ──
-    if (url.pathname === "/admin/close" && req.method === "POST") {
-      const token = req.headers["x-admin-token"] ?? url.searchParams.get("token");
-      if (ADMIN_TOKEN && token !== ADMIN_TOKEN) {
-        res.writeHead(403);
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
-      if (!strategy.position) {
-        res.writeHead(200);
-        res.end(JSON.stringify({ message: "no position to close" }));
-        return;
-      }
-      await executeSell("timeout");
-      res.writeHead(200);
-      res.end(JSON.stringify({ message: "position closed", ...strategy.getState() }));
-      return;
-    }
-
-    // ── Debug: inspect raw bars ──
-    if (url.pathname === "/debug/bars") {
-      const bars = strategy.bars;
-      const n = bars.length;
-      const first5 = bars.slice(0, 5);
-      const last5 = bars.slice(-5);
-      const ind = strategy.getIndicators();
-      
-      // Compute TRs for ALL bars and find outliers
-      let allTRs: { idx: number; tr: number; bar: any }[] = [];
-      for (let i = 0; i < n; i++) {
-        const b = bars[i];
-        let tr: number;
-        if (i === 0) {
-          tr = b.h - b.l;
-        } else {
-          const prev = bars[i - 1];
-          tr = Math.max(b.h - b.l, Math.abs(b.h - prev.c), Math.abs(b.l - prev.c));
-        }
-        allTRs.push({ idx: i, tr, bar: { t: b.t, date: new Date(b.t * 1000).toISOString(), o: b.o, h: b.h, l: b.l, c: b.c } });
-      }
-      
-      // Sort by TR descending — show top 10 outliers
-      const outliers = [...allTRs].sort((a, b) => b.tr - a.tr).slice(0, 10);
-      
-      // Correct manual ATR from last 14 raw TRs
-      const last14TRs = allTRs.slice(-14).map(x => x.tr);
-      const manualATR14 = last14TRs.reduce((a, b) => a + b, 0) / last14TRs.length;
-      
-      // Check bar timestamps for gaps
-      const gaps: any[] = [];
-      for (let i = 1; i < n; i++) {
-        const dt = bars[i].t - bars[i - 1].t;
-        if (dt > 7200) {  // > 2 hours gap
-          gaps.push({ from: i - 1, to: i, gapHours: (dt / 3600).toFixed(1), fromDate: new Date(bars[i-1].t*1000).toISOString(), toDate: new Date(bars[i].t*1000).toISOString() });
-        }
-      }
-      
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        totalBars: n,
-        first5: first5.map(b => ({ ...b, date: new Date(b.t * 1000).toISOString(), range: (b.h - b.l).toFixed(6) })),
-        last5: last5.map(b => ({ ...b, date: new Date(b.t * 1000).toISOString(), range: (b.h - b.l).toFixed(6) })),
-        computedATR: ind.atr,
-        manualATR14,
-        emaFast: ind.emaFast,
-        emaSlow: ind.emaSlow,
-        top10outlierTRs: outliers,
-        timestampGaps: gaps,
-      }, null, 2));
-      return;
-    }
-
-    res.writeHead(404);
-    res.end(JSON.stringify({ error: "not found" }));
-  });
-
-  server.listen(PORT, () => {
-    console.log(`[HTTP] Listening on :${PORT}`);
-  });
-}
-
-
-// ─── Entry Point ──────────────────────────────────────────────
-
-async function main(): Promise<void> {
-  try {
-    await init();
-    startHttpServer();
-
-    // Main loop
-    console.log(`[LOOP] Starting (interval: ${SAMPLE_INTERVAL_MS / 1000}s)`);
-    setInterval(async () => {
-      try {
-        await mainLoop();
-      } catch (err) {
-        console.error(`[LOOP] Unhandled error: ${err}`);
-      }
-    }, SAMPLE_INTERVAL_MS);
-
-    // Periodic state save (every 5 minutes)
-    setInterval(() => {
-      persistState();
-    }, 5 * 60 * 1000);
-
-  } catch (err) {
-    console.error(`[FATAL] ${err}`);
-    process.exit(1);
-  }
-}
-
-main();
